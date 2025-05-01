@@ -1,10 +1,16 @@
-﻿using ICSharpCode.Decompiler;
+﻿using System;
+using System.CommandLine;
+using System.CommandLine.Invocation;
+using System.IO;
+using ICSharpCode.Decompiler;
 using ICSharpCode.Decompiler.CSharp;
 using ICSharpCode.Decompiler.TypeSystem;
 using System.Text;
 using ICSharpCode.Decompiler.Metadata;
 using ICSharpCode.Decompiler.IL;
 using System.Text.RegularExpressions;
+using System.Linq; // Added for Any() and LINQ methods
+using System.Collections.Generic; // Added for HashSet
 
 partial class Program
 {
@@ -91,14 +97,51 @@ partial class Program
         return resolver;
     }
 
-    static void Main(string[] args)
+    static int Main(string[] args)
     {
-        string sourceDir = "/home/user/rust-template/Managed";
-        string outputDir = "/home/user/rust-template/.knowlenge/Decompiled";
+        var sourceOption = new Option<DirectoryInfo>(
+            aliases: new[] { "-s", "--source" },
+            description: "Директория с исходными DLL файлами.")
+        {
+            IsRequired = true // Делаем аргумент обязательным
+        };
+        sourceOption.AddValidator(result => // Валидатор для проверки существования директории
+        {
+            if (!result.GetValueOrDefault<DirectoryInfo>()?.Exists ?? true)
+            {
+                result.ErrorMessage = $"Директория {result.Tokens.Single().Value} не найдена.";
+            }
+        });
 
+
+        var outputOption = new Option<DirectoryInfo>(
+             aliases: new[] { "-o", "--output" },
+             description: "Директория для сохранения декомпилированных файлов.")
+         {
+             IsRequired = true // Делаем аргумент обязательным
+         };
+
+        var rootCommand = new RootCommand("Декомпилятор DLL файлов в текстовые C# файлы.")
+        {
+            sourceOption,
+            outputOption
+        };
+
+        rootCommand.SetHandler((sourceDir, outputDir) =>
+        {
+            ProcessDirectories(sourceDir.FullName, outputDir.FullName);
+        }, sourceOption, outputOption);
+
+        return rootCommand.Invoke(args);
+    }
+
+    // Выносим основную логику в отдельный метод
+    static void ProcessDirectories(string sourceDir, string outputDir)
+    {
         if (!Directory.Exists(outputDir))
         {
             Directory.CreateDirectory(outputDir);
+            Console.WriteLine($"Создана выходная директория: {outputDir}");
         }
 
         Console.WriteLine($"Начинаем парсинг DLL файлов из директории: {sourceDir}");
@@ -112,7 +155,7 @@ partial class Program
             try
             {
                 string fileName = Path.GetFileNameWithoutExtension(file);
-                
+
                 // Проверяем, является ли библиотека важной
                 if (!ImportantLibraries.Any(lib => fileName.StartsWith(lib, StringComparison.OrdinalIgnoreCase)))
                 {
@@ -121,7 +164,7 @@ partial class Program
                 }
 
                 string outputPath = Path.Combine(outputDir, fileName);
-                
+
                 if (!Directory.Exists(outputPath))
                 {
                     Directory.CreateDirectory(outputPath);
@@ -148,7 +191,9 @@ partial class Program
                         continue;
                     }
 
-                    string typeFileName = $"{type.Name}.cstxt";
+                    // Создаем безопасное имя файла, заменяя недопустимые символы
+                     string safeTypeName = string.Join("_", type.Name.Split(Path.GetInvalidFileNameChars()));
+                     string typeFileName = $"{safeTypeName}.cstxt"; // Используем безопасное имя
                     string typeFilePath = Path.Combine(outputPath, typeFileName);
 
                     try
@@ -160,15 +205,20 @@ partial class Program
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"Ошибка при декомпиляции типа {type.FullName}: {ex.Message}");
+                        Console.WriteLine($"Ошибка при декомпиляции типа {type.FullName} в файл {typeFileName}: {ex.Message}");
                     }
                 }
 
-                Console.WriteLine($"Обработано типов: {processedTypes}, пропущено сгенерированных типов: {skippedGeneratedTypes}");
+                Console.WriteLine($"- Обработано типов: {processedTypes}, пропущено сгенерированных: {skippedGeneratedTypes}");
+            }
+            catch (BadImageFormatException)
+            {
+                Console.WriteLine($"Пропуск файла {Path.GetFileName(file)}, так как он не является валидной .NET сборкой.");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Ошибка при обработке файла {file}: {ex.Message}");
+                Console.WriteLine($"Критическая ошибка при обработке файла {file}: {ex.Message}");
+                // Можно добавить логирование стека вызовов: Console.WriteLine(ex.StackTrace);
             }
         }
 
