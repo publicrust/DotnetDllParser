@@ -135,42 +135,40 @@ partial class Program
         return rootCommand.Invoke(args);
     }
 
+    const long MaxChunkSizeBytes = 950 * 1024; // Примерно 950 KB
+
     // Выносим основную логику в отдельный метод
     static void ProcessDirectories(string sourceDir, string outputDir)
     {
-        if (!Directory.Exists(outputDir))
-        {
-            Directory.CreateDirectory(outputDir);
-            Console.WriteLine($"Создана выходная директория: {outputDir}");
-        }
+        // Создаем базовую выходную директорию, если ее нет
+        Directory.CreateDirectory(outputDir); 
+        Console.WriteLine($"Базовая выходная директория: {outputDir}");
+
 
         Console.WriteLine($"Начинаем парсинг DLL файлов из директории: {sourceDir}");
-        Console.WriteLine($"Результаты будут сохранены в: {outputDir}");
+        // Console.WriteLine($"Результаты будут сохранены в поддиректориях {outputDir}"); // Изменено сообщение
 
         // Создаем резолвер сборок
         var assemblyResolver = CreateAssemblyResolver(sourceDir);
 
         foreach (string file in Directory.GetFiles(sourceDir, "*.dll"))
         {
+            string baseFileName = Path.GetFileNameWithoutExtension(file);
             try
             {
-                string fileName = Path.GetFileNameWithoutExtension(file);
-
-                // Проверяем, является ли библиотека важной
-                if (!ImportantLibraries.Any(lib => fileName.StartsWith(lib, StringComparison.OrdinalIgnoreCase)))
+                 // Проверяем, является ли библиотека важной
+                if (!ImportantLibraries.Any(lib => baseFileName.StartsWith(lib, StringComparison.OrdinalIgnoreCase)))
                 {
-                    Console.WriteLine($"Пропускаем неважную библиотеку: {fileName}");
+                    Console.WriteLine($"Пропускаем неважную библиотеку: {baseFileName}");
                     continue;
                 }
 
-                string outputPath = Path.Combine(outputDir, fileName);
+                Console.WriteLine($"Обработка важной библиотеки: {baseFileName}");
 
-                if (!Directory.Exists(outputPath))
-                {
-                    Directory.CreateDirectory(outputPath);
-                }
-
-                Console.WriteLine($"Обработка важной библиотеки: {fileName}");
+                // Создаем поддиректорию для текущей DLL
+                string dllOutputDir = Path.Combine(outputDir, baseFileName);
+                Directory.CreateDirectory(dllOutputDir);
+                Console.WriteLine($"Обработка важной библиотеки: {baseFileName} -> {dllOutputDir}");
 
                 // Создаем декомпилятор с резолвером сборок
                 var decompiler = new CSharpDecompiler(file, assemblyResolver, new DecompilerSettings());
@@ -178,8 +176,14 @@ partial class Program
 
                 int skippedGeneratedTypes = 0;
                 int processedTypes = 0;
+                int chunkCount = 1;
+                StringBuilder currentChunkContent = new StringBuilder();
 
-                // Сохраняем каждый тип в отдельный файл
+                 // Формируем путь к файлу чанка ВНУТРИ поддиректории DLL
+                 string GetChunkFilePath(int count) => Path.Combine(dllOutputDir, $"{baseFileName}_chunk{count}.cstxt");
+                 string currentChunkFilePath = GetChunkFilePath(chunkCount);
+
+                // Обрабатываем типы
                 foreach (var type in types)
                 {
                     if (string.IsNullOrEmpty(type.Name)) continue;
@@ -191,34 +195,55 @@ partial class Program
                         continue;
                     }
 
-                    // Создаем безопасное имя файла, заменяя недопустимые символы
-                     string safeTypeName = string.Join("_", type.Name.Split(Path.GetInvalidFileNameChars()));
-                     string typeFileName = $"{safeTypeName}.cstxt"; // Используем безопасное имя
-                    string typeFilePath = Path.Combine(outputPath, typeFileName);
-
                     try
                     {
                         // Декомпилируем тип в C# код
                         string code = decompiler.DecompileAsString(type.MetadataToken);
-                        File.WriteAllText(typeFilePath, code);
+                        string codeWithSeparator = code + Environment.NewLine + Environment.NewLine; // Добавляем разделитель
+
+                        // Проверяем, нужно ли начинать новый чанк
+                        // Проверяем только если в текущем чанке уже есть содержимое
+                        if (currentChunkContent.Length > 0 && currentChunkContent.Length + codeWithSeparator.Length > MaxChunkSizeBytes)
+                        {
+                             // Записываем текущий чанк
+                            File.WriteAllText(currentChunkFilePath, currentChunkContent.ToString());
+                            Console.WriteLine($"  - Записан чанк: {Path.GetFileName(currentChunkFilePath)} ({currentChunkContent.Length} байт)");
+                            
+                            // Начинаем новый чанк
+                            chunkCount++;
+                            currentChunkFilePath = GetChunkFilePath(chunkCount);
+                            currentChunkContent.Clear();
+                        }
+
+                        // Добавляем код в текущий чанк
+                        currentChunkContent.Append(codeWithSeparator);
                         processedTypes++;
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"Ошибка при декомпиляции типа {type.FullName} в файл {typeFileName}: {ex.Message}");
+                        // Используем безопасное имя типа для логгирования
+                        string safeTypeName = string.Join("_", type.Name.Split(Path.GetInvalidFileNameChars()));
+                        Console.WriteLine($"Ошибка при декомпиляции типа {type.FullName} (в {safeTypeName}): {ex.Message}");
                     }
                 }
+                 // Записываем последний чанк, если он не пустой
+                if (currentChunkContent.Length > 0)
+                {
+                    File.WriteAllText(currentChunkFilePath, currentChunkContent.ToString());
+                    Console.WriteLine($"  - Записан чанк: {Path.GetFileName(currentChunkFilePath)} ({currentChunkContent.Length} байт)");
+                }
 
-                Console.WriteLine($"- Обработано типов: {processedTypes}, пропущено сгенерированных: {skippedGeneratedTypes}");
+
+                Console.WriteLine($"-> {baseFileName}: Обработано типов: {processedTypes}, пропущено сгенерированных: {skippedGeneratedTypes}, создано чанков: {chunkCount}");
             }
             catch (BadImageFormatException)
             {
-                Console.WriteLine($"Пропуск файла {Path.GetFileName(file)}, так как он не является валидной .NET сборкой.");
+                Console.WriteLine($"Пропуск файла {baseFileName}, так как он не является валидной .NET сборкой.");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Критическая ошибка при обработке файла {file}: {ex.Message}");
-                // Можно добавить логирование стека вызовов: Console.WriteLine(ex.StackTrace);
+                Console.WriteLine($"Критическая ошибка при обработке файла {baseFileName}: {ex.Message}");
+                // Console.WriteLine(ex.StackTrace);
             }
         }
 
